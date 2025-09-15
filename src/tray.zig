@@ -43,7 +43,53 @@ const NOTIFYICONDATAW = extern struct {
 pub const TrayNotificationError = error{
     NotificationFailed,
     OutOfMemory,
+    NotInitialized,
 };
+
+const TrayState = struct {
+    initialized: bool = false,
+    nid: NOTIFYICONDATAW = undefined,
+};
+
+var global_state: TrayState = .{ .initialized = false };
+
+pub fn initTray(allocator: std.mem.Allocator, tooltip: []const u8) TrayNotificationError!void {
+    if (global_state.initialized) return; // already
+
+    const tip_wide = utf8ToWide(allocator, tooltip) catch return TrayNotificationError.OutOfMemory;
+    defer allocator.free(tip_wide);
+
+    var nid = NOTIFYICONDATAW{
+        .cbSize = @sizeOf(NOTIFYICONDATAW),
+        .hWnd = null,
+        .uID = 1,
+        .uFlags = NIF_TIP | NIF_ICON, // icon optional (null) but keep slot in tray
+        .uCallbackMessage = 0,
+        .hIcon = null,
+        .szTip = copyToFixedArray(u16, 128, tip_wide),
+        .dwState = 0,
+        .dwStateMask = 0,
+        .szInfo = [_]u16{0} ** 256,
+        .uVersion = 0,
+        .szInfoTitle = [_]u16{0} ** 64,
+        .dwInfoFlags = 0,
+        .guidItem = std.mem.zeroes(windows.GUID),
+        .hBalloonIcon = null,
+    };
+
+    if (Shell_NotifyIconW(NIM_ADD, &nid) == 0) {
+        return TrayNotificationError.NotificationFailed;
+    }
+
+    global_state.nid = nid;
+    global_state.initialized = true;
+}
+
+pub fn deinitTray() void {
+    if (!global_state.initialized) return;
+    _ = Shell_NotifyIconW(NIM_DELETE, &global_state.nid);
+    global_state.initialized = false;
+}
 
 fn utf8ToWide(allocator: std.mem.Allocator, utf8: []const u8) ![:0]u16 {
     const wide_len = try std.unicode.calcUtf16LeLen(utf8);
@@ -60,40 +106,25 @@ fn copyToFixedArray(comptime T: type, comptime size: usize, source: []const T) [
 }
 
 pub fn sendSystemTrayNotification(allocator: std.mem.Allocator, title: []const u8, message: []const u8) TrayNotificationError!void {
-    // Convert UTF-8 to UTF-16
+    if (!global_state.initialized) return TrayNotificationError.NotInitialized;
+
     const title_wide = utf8ToWide(allocator, title) catch return TrayNotificationError.OutOfMemory;
     defer allocator.free(title_wide);
-
     const message_wide = utf8ToWide(allocator, message) catch return TrayNotificationError.OutOfMemory;
     defer allocator.free(message_wide);
 
-    // Create notification data
-    var nid = NOTIFYICONDATAW{
-        .cbSize = @sizeOf(NOTIFYICONDATAW),
-        .hWnd = null,
-        .uID = 1,
-        .uFlags = NIF_INFO,
-        .uCallbackMessage = 0,
-        .hIcon = null,
-        .szTip = [_]u16{0} ** 128,
-        .dwState = 0,
-        .dwStateMask = 0,
-        .szInfo = copyToFixedArray(u16, 256, message_wide),
-        .uVersion = 5000, // 5 second timeout
-        .szInfoTitle = copyToFixedArray(u16, 64, title_wide),
-        .dwInfoFlags = NIIF_INFO,
-        .guidItem = std.mem.zeroes(windows.GUID),
-        .hBalloonIcon = null,
-    };
+    // Reuse existing nid, only set info fields
+    var nid_ptr = &global_state.nid;
+    nid_ptr.uFlags = NIF_INFO | NIF_TIP;
+    nid_ptr.szInfo = copyToFixedArray(u16, 256, message_wide);
+    nid_ptr.szInfoTitle = copyToFixedArray(u16, 64, title_wide);
+    nid_ptr.uVersion = 10000; // 10 seconds
+    nid_ptr.dwInfoFlags = NIIF_INFO;
 
-    // Show the notification
-    const result = Shell_NotifyIconW(NIM_ADD, &nid);
-    if (result == 0) {
+    // Modify existing icon entry to show balloon
+    if (Shell_NotifyIconW(NIM_MODIFY, nid_ptr) == 0) {
         return TrayNotificationError.NotificationFailed;
     }
-
-    // Clean up - remove the icon after showing
-    _ = Shell_NotifyIconW(NIM_DELETE, &nid);
 }
 
 // Fallback: Simple console notification that looks like a desktop notification
